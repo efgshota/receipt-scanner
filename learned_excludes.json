@@ -1,0 +1,26 @@
+{
+  "Anthropic": [
+    "was unsuccessful",
+    "welcome to the pro plan"
+  ],
+  "DeepL": [
+    "has expired",
+    "about to expire",
+    "deepl proへようこそ"
+  ],
+  "Dropbox": [
+    "プランが変更されました"
+  ],
+  "ANA": [
+    "搭乗案内開始のお知らせ",
+    "搭乗口変更のお知らせ",
+    "国内線運賃がリニューアル"
+  ],
+  "Adobe": [
+    "無料期間付与のお知らせ"
+  ],
+  "Akiflow": [
+    "keep your setup after the trial",
+    "your trial ends in"
+  ]
+}

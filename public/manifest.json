@@ -1,0 +1,21 @@
+{
+  "name": "Receipt Scanner",
+  "short_name": "Receipt",
+  "description": "経費精算自動化システム",
+  "start_url": "/upload",
+  "display": "standalone",
+  "background_color": "#f8f9fa",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
