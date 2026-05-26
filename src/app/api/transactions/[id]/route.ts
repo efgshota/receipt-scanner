@@ -40,6 +40,10 @@ export async function PATCH(
   if (body.confidence !== undefined) updateData.confidence = body.confidence;
   if (body.classificationReason)
     updateData.classificationReason = body.classificationReason;
+  if (body.amount !== undefined) updateData.amount = body.amount;
+  if (body.vendor) updateData.vendor = body.vendor;
+  if (body.date) updateData.date = body.date;
+  if (body.description !== undefined) updateData.description = body.description;
 
   const [updated] = await db
     .update(transactions)

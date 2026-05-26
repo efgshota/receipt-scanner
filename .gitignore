@@ -46,6 +46,7 @@ token.pickle
 # personal data (receipts, financial docs)
 /receipts/
 /done/
+/public/uploads/
 fujii_shota_handoff.md
 
 # vercel

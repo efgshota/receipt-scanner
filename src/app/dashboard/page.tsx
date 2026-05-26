@@ -63,6 +63,7 @@ export default function DashboardPage() {
   const [filterStatus, setFilterStatus] = useState<string>("all");
   const [filterBucket, setFilterBucket] = useState<string>("all");
   const [loading, setLoading] = useState(true);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
 
   const fetchTransactions = useCallback(async () => {
     setLoading(true);
@@ -106,12 +107,25 @@ export default function DashboardPage() {
     <div className="max-w-7xl mx-auto px-4 py-8">
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-2xl font-bold">Receipt Scanner</h1>
-        <a
-          href="/upload"
-          className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
-        >
-          レシート撮影
-        </a>
+        <div className="flex gap-2">
+          <button
+            onClick={() => {
+              const params = new URLSearchParams();
+              if (filterStatus !== "all") params.set("status", filterStatus);
+              if (filterBucket !== "all") params.set("bucket", filterBucket);
+              window.location.href = `/api/transactions/export?${params}`;
+            }}
+            className="px-4 py-2 bg-gray-100 text-gray-800 rounded-lg hover:bg-gray-200 transition-colors"
+          >
+            CSV出力
+          </button>
+          <a
+            href="/upload"
+            className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
+          >
+            レシート撮影
+          </a>
+        </div>
       </div>
 
       {/* Summary cards */}
@@ -169,6 +183,7 @@ export default function DashboardPage() {
                 <th className="text-left p-3">バケツ</th>
                 <th className="text-left p-3">確信度</th>
                 <th className="text-left p-3">ステータス</th>
+                <th className="text-left p-3">画像</th>
                 <th className="text-left p-3">操作</th>
               </tr>
             </thead>
@@ -180,7 +195,14 @@ export default function DashboardPage() {
                 >
                   <td className="p-3 whitespace-nowrap">{tx.date}</td>
                   <td className="p-3">
-                    <div className="font-medium">{tx.vendor}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">{tx.vendor}</span>
+                      {!tx.receiptImageUrl && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-100 text-orange-700">
+                          レシートなし
+                        </span>
+                      )}
+                    </div>
                     {tx.description && (
                       <div className="text-xs text-muted">{tx.description}</div>
                     )}
@@ -200,6 +222,18 @@ export default function DashboardPage() {
                   <td className="p-3">{confidenceBar(tx.confidence)}</td>
                   <td className="p-3">
                     <span className="text-xs">{STATUS_LABELS[tx.status]}</span>
+                  </td>
+                  <td className="p-3">
+                    {tx.receiptImageUrl ? (
+                      <button
+                        onClick={() => setPreviewImage(tx.receiptImageUrl)}
+                        className="text-xs px-2 py-1 bg-blue-100 text-blue-800 rounded hover:bg-blue-200"
+                      >
+                        表示
+                      </button>
+                    ) : (
+                      <span className="text-xs text-muted">—</span>
+                    )}
                   </td>
                   <td className="p-3">
                     <div className="flex gap-1">
@@ -238,6 +272,28 @@ export default function DashboardPage() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Image preview modal */}
+      {previewImage && (
+        <div
+          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+          onClick={() => setPreviewImage(null)}
+        >
+          <div className="relative max-w-2xl max-h-[90vh]" onClick={(e) => e.stopPropagation()}>
+            <button
+              onClick={() => setPreviewImage(null)}
+              className="absolute -top-3 -right-3 w-8 h-8 bg-white rounded-full shadow flex items-center justify-center text-gray-600 hover:text-gray-900"
+            >
+              ✕
+            </button>
+            <img
+              src={previewImage}
+              alt="Receipt"
+              className="max-h-[85vh] rounded-lg shadow-lg"
+            />
+          </div>
         </div>
       )}
     </div>
