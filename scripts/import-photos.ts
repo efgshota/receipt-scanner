@@ -159,33 +159,117 @@ function macosTimestampToDate(ts: number): Date {
   return new Date((ts + MACOS_EPOCH_OFFSET) * 1000);
 }
 
+// ── iCloud Download (AppleScript) ──────────────────
+
+const EXPORT_DIR = path.join(os.homedir(), ".config/receipt-scanner/exports");
+
+/**
+ * AppleScript で写真アプリから指定UUIDの写真をエクスポート。
+ * iCloud上のみの写真も自動ダウンロード→エクスポートされる。
+ */
+async function exportFromPhotos(uuid: string): Promise<string | null> {
+  const { execSync } = await import("child_process");
+
+  if (!fs.existsSync(EXPORT_DIR)) {
+    fs.mkdirSync(EXPORT_DIR, { recursive: true });
+  }
+
+  const script = `
+    tell application "Photos"
+      set targetMedia to (every media item whose id contains "${uuid}")
+      if (count of targetMedia) = 0 then
+        return "NOT_FOUND"
+      end if
+      set exportFolder to POSIX file "${EXPORT_DIR}" as alias
+      export targetMedia to exportFolder
+      return "OK"
+    end tell
+  `;
+
+  try {
+    // AppleScript を一時ファイルに書き出して実行（引用符エスケープ問題を回避）
+    const scriptFile = path.join(EXPORT_DIR, "_export.scpt");
+    fs.writeFileSync(scriptFile, script);
+    const result = execSync(`osascript "${scriptFile}"`, {
+      timeout: 300000,
+    }).toString().trim();
+    fs.unlinkSync(scriptFile);
+
+    if (result === "NOT_FOUND") return null;
+
+    // エクスポートされたファイルを探す
+    const files = fs.readdirSync(EXPORT_DIR)
+      .filter((f) => !f.startsWith("_"))
+      .map((f) => ({ name: f, time: fs.statSync(path.join(EXPORT_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.time - a.time);
+
+    if (files.length === 0) return null;
+
+    const exportedPath = path.join(EXPORT_DIR, files[0].name);
+
+    // 5MB超の場合は sips でリサイズ（Claude API制限）
+    const fileSize = fs.statSync(exportedPath).size;
+    if (fileSize > 4 * 1024 * 1024) {
+      const resizedPath = path.join(EXPORT_DIR, `resized_${files[0].name.replace(/\.\w+$/, ".jpeg")}`);
+      execSync(
+        `sips -s format jpeg -s formatOptions 80 --resampleWidth 2048 "${exportedPath}" --out "${resizedPath}"`,
+        { timeout: 30000 }
+      );
+      fs.unlinkSync(exportedPath);
+      return resizedPath;
+    }
+
+    return exportedPath;
+  } catch (e) {
+    console.log(`  ⚠ AppleScript error: ${e}`);
+    return null;
+  }
+}
+
+function cleanupExport(filePath: string) {
+  try { fs.unlinkSync(filePath); } catch {}
+}
+
 // ── Upload ──────────────────────────────────────────
 
 async function uploadPhoto(
-  filePath: string
+  filePath: string,
+  retries = 2
 ): Promise<{ transactionId: string }> {
   const fileBuffer = fs.readFileSync(filePath);
   const filename = path.basename(filePath);
 
-  const formData = new FormData();
-  formData.append(
-    "file",
-    new Blob([fileBuffer], { type: "image/jpeg" }),
-    filename
-  );
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const formData = new FormData();
+      formData.append(
+        "file",
+        new Blob([fileBuffer], { type: "image/jpeg" }),
+        filename
+      );
 
-  const res = await fetch(`${API_BASE}/api/receipts/upload`, {
-    method: "POST",
-    body: formData,
-  });
+      const res = await fetch(`${API_BASE}/api/receipts/upload`, {
+        method: "POST",
+        body: formData,
+      });
 
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`Upload failed (${res.status}): ${errorText}`);
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Upload failed (${res.status}): ${errorText}`);
+      }
+
+      const data = await res.json();
+      return { transactionId: data.transaction.id };
+    } catch (error) {
+      if (attempt < retries) {
+        console.log(`  ⟳ Retry ${attempt + 1}/${retries} (waiting 5s)...`);
+        await new Promise((r) => setTimeout(r, 5000));
+      } else {
+        throw error;
+      }
+    }
   }
-
-  const data = await res.json();
-  return { transactionId: data.transaction.id };
+  throw new Error("Unreachable");
 }
 
 // ── Main ────────────────────────────────────────────
@@ -224,19 +308,48 @@ async function main() {
       `Processing: ${photo.filename} (${date.toISOString().slice(0, 10)})`
     );
 
-    // Check if file exists locally (may not be downloaded from iCloud)
+    // ファイル取得: ローカルにあればそのまま、なければ AppleScript でエクスポート
+    let uploadPath = filePath;
+    let needsCleanup = false;
+
     if (!fs.existsSync(filePath)) {
-      console.log(`  ⚠ File not available locally (iCloud only), skipping`);
-      continue;
+      console.log(`  ☁ Exporting from Photos app...`);
+      const exported = await exportFromPhotos(photo.uuid);
+      if (!exported) {
+        console.log(`  ⚠ Failed to export, skipping`);
+        continue;
+      }
+      uploadPath = exported;
+      needsCleanup = true;
+      console.log(`  ✓ Exported`);
+    }
+
+    // DNG/RAW や 4MB超のファイルは JPEG に変換・リサイズ
+    const fileSize = fs.statSync(uploadPath).size;
+    const isDng = uploadPath.toLowerCase().endsWith(".dng");
+    if (isDng || fileSize > 4 * 1024 * 1024) {
+      const { execSync } = await import("child_process");
+      const resizedPath = path.join(EXPORT_DIR, `upload_${photo.uuid}.jpeg`);
+      if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
+      console.log(`  🔄 Converting to JPEG (${(fileSize / 1024 / 1024).toFixed(1)}MB)...`);
+      execSync(
+        `sips -s format jpeg -s formatOptions 80 --resampleWidth 2048 "${uploadPath}" --out "${resizedPath}"`,
+        { timeout: 30000 }
+      );
+      if (needsCleanup) cleanupExport(uploadPath);
+      uploadPath = resizedPath;
+      needsCleanup = true;
+      console.log(`  ✓ Converted (${(fs.statSync(resizedPath).size / 1024).toFixed(0)}KB)`);
     }
 
     if (DRY_RUN) {
-      console.log(`  [DRY RUN] Would upload: ${filePath}`);
+      console.log(`  [DRY RUN] Would upload: ${uploadPath}`);
+      if (needsCleanup) cleanupExport(uploadPath);
       continue;
     }
 
     try {
-      const result = await uploadPhoto(filePath);
+      const result = await uploadPhoto(uploadPath);
       tracking.photos.push({
         uuid: photo.uuid,
         filename: photo.filename,
@@ -246,6 +359,9 @@ async function main() {
       });
       successCount++;
       console.log(`  ✓ Uploaded (tx: ${result.transactionId})`);
+      if (needsCleanup) cleanupExport(uploadPath);
+      // サーバー負荷軽減のため待機
+      await new Promise((r) => setTimeout(r, 3000));
     } catch (error) {
       tracking.photos.push({
         uuid: photo.uuid,
@@ -256,6 +372,7 @@ async function main() {
       });
       errorCount++;
       console.log(`  ✗ Error: ${error}`);
+      if (needsCleanup) cleanupExport(uploadPath);
     }
   }
 

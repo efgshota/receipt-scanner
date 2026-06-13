@@ -35,7 +35,7 @@ export const transactions = pgTable("transactions", {
   sourceId: text("source_id"),
   vendor: text("vendor").notNull(),
   amount: integer("amount").notNull(),
-  date: date("date").notNull(),
+  date: date("date"),
   description: text("description").notNull().default(""),
   invoiceNumber: text("invoice_number"),
   receiptImageUrl: text("receipt_image_url"),

@@ -29,6 +29,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+dev.log
 
 # env files
 .env*
@@ -46,6 +47,7 @@ token.pickle
 # personal data (receipts, financial docs)
 /receipts/
 /done/
+/public/uploads/
 fujii_shota_handoff.md
 
 # vercel
