@@ -37,10 +37,15 @@ export async function GET(request: Request) {
     "ID",
   ];
 
+  // 数式インジェクション対策の対象文字（先頭がこれらの文字列）
+  const FORMULA = /^[=+\-@\t\r]/;
   const escape = (v: unknown): string => {
     if (v === null || v === undefined) return "";
-    const s = String(v).replace(/"/g, '""');
-    return /[",\n]/.test(s) ? `"${s}"` : s;
+    let s = String(v);
+    // 数値型(金額/確信度)は対象外＝先頭'を付けて値を壊さない
+    if (typeof v !== "number" && FORMULA.test(s)) s = "'" + s;
+    s = s.replace(/"/g, '""');
+    return /[",\n\r]/.test(s) ? `"${s}"` : s;
   };
 
   const lines = [header.join(",")];

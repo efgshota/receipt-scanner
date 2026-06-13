@@ -18,7 +18,7 @@ export async function GET(request: Request) {
     query = query.where(eq(transactions.bucket, bucket)) as typeof query;
   }
 
-  const results = await query.limit(200);
+  const results = await query.limit(1000);
 
   return NextResponse.json({ transactions: results });
 }

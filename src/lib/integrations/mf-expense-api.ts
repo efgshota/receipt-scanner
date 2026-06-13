@@ -57,11 +57,19 @@ async function getAccessToken(company: "nagi" | "stadiums"): Promise<string> {
   let tokens = tokenCache[company];
 
   if (!tokens) {
-    // Load from env or initial setup
+    // Load from tokens.json at runtime (file is gitignored, may be absent)
     // For now, we only support NAGI with existing tokens
     if (company === "nagi") {
-      const tokensJson = await import("../../../tokens.json");
-      tokens = tokensJson.nagi as MfTokens;
+      const fs = await import("fs");
+      const path = await import("path");
+      const tokensPath = path.join(process.cwd(), "tokens.json");
+      if (!fs.existsSync(tokensPath)) {
+        throw new Error("tokens.json not found — MF OAuth tokens not configured");
+      }
+      const parsed = JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as {
+        nagi: MfTokens;
+      };
+      tokens = parsed.nagi;
       tokenCache[company] = tokens;
     } else {
       throw new Error("stadiums MF tokens not configured");
