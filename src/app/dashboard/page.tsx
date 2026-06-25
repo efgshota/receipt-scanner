@@ -16,9 +16,15 @@ interface Transaction {
   confidence: number | null;
   classificationReason: string | null;
   status: TransactionStatus;
+  mfTransactionId: string | null;
   submittedAt: string | null;
   createdAt: string;
 }
+
+// バケツ→MFクラウド経費の対象会社（family は MF ME 共有運用＝API対象外）
+const MF_BUCKETS: Bucket[] = ["nagi", "stadiums"];
+const isMfBucket = (b: Bucket | null): boolean =>
+  b !== null && MF_BUCKETS.includes(b);
 
 interface StatusCell {
   count: number;
@@ -78,6 +84,8 @@ interface Anomaly {
 function detectAnomalies(tx: Transaction): Anomaly[] {
   const a: Anomaly[] = [];
   if (!tx.date) a.push({ label: "日付なし", cls: "bg-red-100 text-red-700" });
+  else if (Number(tx.date.slice(0, 4)) < 2025)
+    a.push({ label: "日付要確認", cls: "bg-red-100 text-red-700" });
   if (tx.amount <= 0) a.push({ label: "¥0要確認", cls: "bg-red-100 text-red-700" });
   if (tx.amount >= 100000) a.push({ label: "高額", cls: "bg-orange-100 text-orange-700" });
   if (tx.classificationReason?.includes("⚠"))
@@ -90,6 +98,7 @@ function detectAnomalies(tx: Transaction): Anomaly[] {
 // 一括承認で除外すべき「目視必須」の異常（レシートなしは情報バッジなので除外しない）
 function needsManualReview(tx: Transaction): boolean {
   if (!tx.date) return true;
+  if (Number(tx.date.slice(0, 4)) < 2025) return true;
   if (tx.amount <= 0) return true;
   if (tx.amount >= 100000) return true;
   if (tx.classificationReason?.includes("⚠")) return true;
@@ -245,6 +254,58 @@ export default function DashboardPage() {
     if (!res.ok) alert(`処理できませんでした: ${data.error ?? res.status}`);
   }
 
+  // 取引1件をMFクラウド経費へ直接提出
+  async function submitToMf(id: string) {
+    if (busy) return;
+    if (!confirm("この取引をMFクラウド経費へ提出します。よろしいですか？")) return;
+    setBusy(true);
+    const res = await fetch(`/api/transactions/${id}/submit`, { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    await fetchAll();
+    setBusy(false);
+    if (!res.ok) alert(`MF提出に失敗しました: ${data.error ?? res.status}`);
+  }
+
+  // バケツ内の承認済をまとめてMFクラウド経費へ提出
+  async function submitBucketToMf(bucket: Bucket) {
+    if (busy) return;
+    const targets = transactions.filter(
+      (t) => t.bucket === bucket && t.status === "approved"
+    );
+    if (targets.length === 0) {
+      alert("承認済の取引がありません（先に承認してください）");
+      return;
+    }
+    if (
+      !confirm(
+        `${BUCKET_LABELS[bucket]}: 承認済 ${targets.length}件をMFクラウド経費へ提出します。\nよろしいですか？`
+      )
+    )
+      return;
+    setBusy(true);
+    const res = await fetch("/api/transactions/submit-bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: targets.map((t) => t.id) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    await fetchAll();
+    setBusy(false);
+    if (!res.ok) {
+      alert(`MF一括提出に失敗しました: ${data.error ?? res.status}`);
+      return;
+    }
+    if (data.aborted) {
+      alert(`MF未設定のため中断しました: ${data.aborted}`);
+    } else if (data.failedCount > 0) {
+      alert(
+        `提出 ${data.submitted}件 / 失敗 ${data.failedCount}件。\n失敗の先頭: ${data.failed?.[0]?.error ?? "-"}`
+      );
+    } else {
+      alert(`${data.submitted}件をMFへ提出しました`);
+    }
+  }
+
   function startEdit(tx: Transaction) {
     setEditingId(tx.id);
     setDraft({
@@ -386,14 +447,24 @@ export default function DashboardPage() {
                 >
                   一括承認
                 </button>
+                {isMfBucket(bs.bucket) && (
+                  <button
+                    disabled={busy}
+                    onClick={() => submitBucketToMf(bs.bucket)}
+                    className="text-xs px-2 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    MFへ一括提出
+                  </button>
+                )}
                 <button
                   disabled={busy}
                   onClick={() =>
                     bulk(bs.bucket, ["approved"], "submitted", "「提出済」にします（精算実行後に押す）。")
                   }
                   className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded hover:bg-green-200 disabled:opacity-50"
+                  title="MF連携を使わず手動で提出済にする（CSV取込後など）"
                 >
-                  承認済→提出済
+                  手動で提出済
                 </button>
                 <a
                   href={exportUrl(bs.bucket)}
@@ -618,6 +689,14 @@ export default function DashboardPage() {
                     {/* ステータス */}
                     <td className="p-2 whitespace-nowrap">
                       <span className="text-xs">{STATUS_LABELS[tx.status]}</span>
+                      {tx.mfTransactionId && (
+                        <div
+                          className="text-[10px] text-emerald-700 font-medium"
+                          title={`MF取引ID: ${tx.mfTransactionId}`}
+                        >
+                          ✓ MF連携済
+                        </div>
+                      )}
                       {tx.submittedAt && (
                         <div className="text-[10px] text-muted">
                           {new Date(tx.submittedAt).toLocaleDateString("ja-JP")}
@@ -664,13 +743,23 @@ export default function DashboardPage() {
                                 承認
                               </button>
                             )}
+                            {tx.status === "approved" && isMfBucket(tx.bucket) && (
+                              <button
+                                disabled={busy}
+                                onClick={() => submitToMf(tx.id)}
+                                className="text-xs px-2 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-50"
+                              >
+                                MFへ提出
+                              </button>
+                            )}
                             {tx.status === "approved" && (
                               <button
                                 disabled={busy}
                                 onClick={() => patchTx(tx.id, { status: "submitted" })}
                                 className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded hover:bg-green-200 disabled:opacity-50"
+                                title="MF連携を使わず手動で提出済にする"
                               >
-                                提出済
+                                提出済（手動）
                               </button>
                             )}
                             {locked && (

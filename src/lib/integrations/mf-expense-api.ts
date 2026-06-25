@@ -9,7 +9,6 @@ interface MfTokens {
 }
 
 interface MfTransactionInput {
-  officeId: string;
   date: string;
   amount: number;
   vendor: string;
@@ -17,11 +16,84 @@ interface MfTransactionInput {
   invoiceNumber?: string | null;
 }
 
+export type MfCompany = "nagi" | "stadiums";
+
+/**
+ * バケツ → MFクラウド経費の会社マッピング。
+ * family は「MF MEで妻に共有」運用のため経費APIの対象外（null）。
+ */
+export function mfCompanyForBucket(bucket: string | null): MfCompany | null {
+  if (bucket === "nagi") return "nagi";
+  if (bucket === "stadiums") return "stadiums";
+  return null;
+}
+
 // In-memory token cache (will be replaced with DB storage in Phase 2)
 const tokenCache: Record<string, MfTokens> = {};
 
+/**
+ * MF連携が利用可能かを事前チェック（UIに「未設定/再認証が必要」を明示するため）。
+ * 認証情報や有効なトークンが無い場合に submit ルートが 503 を返せるようにする。
+ */
+export function getMfConfigStatus(
+  company: MfCompany
+): { configured: boolean; reason?: string } {
+  const prefix = company === "nagi" ? "MF_NAGI" : "MF_STADIUMS";
+  const missing = [
+    `${prefix}_CLIENT_ID`,
+    `${prefix}_CLIENT_SECRET`,
+    `${prefix}_OFFICE_ID`,
+  ].filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    return {
+      configured: false,
+      reason: `MFクラウド経費の認証情報が未設定です（.env: ${missing.join(", ")}）`,
+    };
+  }
+
+  // OAuthトークン（tokens.json）の有無と有効期限を確認
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("fs") as typeof import("fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("path") as typeof import("path");
+    const tokensPath = path.join(process.cwd(), "tokens.json");
+    if (!fs.existsSync(tokensPath)) {
+      return { configured: false, reason: "tokens.json が無く OAuth 未認証です" };
+    }
+    const parsed = JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as Record<
+      string,
+      MfTokens | undefined
+    >;
+    const t = parsed[company];
+    if (!t) {
+      return {
+        configured: false,
+        reason: `tokens.json に ${company} のトークンがありません（要OAuth認証）`,
+      };
+    }
+    // refresh_token があれば access_token が失効していても更新可能
+    if (!t.refresh_token) {
+      const expiresAt = (t.created_at + t.expires_in) * 1000;
+      if (Date.now() > expiresAt) {
+        return {
+          configured: false,
+          reason: `${company} のトークンが失効しており refresh_token もありません（要再OAuth認証）`,
+        };
+      }
+    }
+  } catch (e) {
+    return {
+      configured: false,
+      reason: `トークン確認に失敗: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+
+  return { configured: true };
+}
+
 async function refreshToken(
-  company: "nagi" | "stadiums",
+  company: MfCompany,
   tokens: MfTokens
 ): Promise<MfTokens> {
   const clientId =
@@ -50,30 +122,51 @@ async function refreshToken(
 
   const newTokens = (await res.json()) as MfTokens;
   tokenCache[company] = newTokens;
+  persistTokens(company, newTokens);
   return newTokens;
 }
 
-async function getAccessToken(company: "nagi" | "stadiums"): Promise<string> {
+/** リフレッシュ後の新トークンを tokens.json に書き戻す（再起動後も有効に保つ） */
+function persistTokens(company: MfCompany, tokens: MfTokens): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("fs") as typeof import("fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("path") as typeof import("path");
+    const tokensPath = path.join(process.cwd(), "tokens.json");
+    const parsed = fs.existsSync(tokensPath)
+      ? (JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as Record<string, unknown>)
+      : {};
+    parsed[company] = tokens;
+    fs.writeFileSync(tokensPath, JSON.stringify(parsed, null, 2));
+  } catch {
+    // 書き戻し失敗は致命的でない（メモリキャッシュで当面動作する）
+  }
+}
+
+async function getAccessToken(company: MfCompany): Promise<string> {
   let tokens = tokenCache[company];
 
   if (!tokens) {
     // Load from tokens.json at runtime (file is gitignored, may be absent)
-    // For now, we only support NAGI with existing tokens
-    if (company === "nagi") {
-      const fs = await import("fs");
-      const path = await import("path");
-      const tokensPath = path.join(process.cwd(), "tokens.json");
-      if (!fs.existsSync(tokensPath)) {
-        throw new Error("tokens.json not found — MF OAuth tokens not configured");
-      }
-      const parsed = JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as {
-        nagi: MfTokens;
-      };
-      tokens = parsed.nagi;
-      tokenCache[company] = tokens;
-    } else {
-      throw new Error("stadiums MF tokens not configured");
+    const fs = await import("fs");
+    const path = await import("path");
+    const tokensPath = path.join(process.cwd(), "tokens.json");
+    if (!fs.existsSync(tokensPath)) {
+      throw new Error("tokens.json not found — MF OAuth tokens not configured");
     }
+    const parsed = JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as Record<
+      string,
+      MfTokens | undefined
+    >;
+    const loaded = parsed[company];
+    if (!loaded) {
+      throw new Error(
+        `tokens.json に ${company} のトークンがありません（要OAuth認証）`
+      );
+    }
+    tokens = loaded;
+    tokenCache[company] = tokens;
   }
 
   // Check if token is expired (with 5 min buffer)
@@ -86,7 +179,7 @@ async function getAccessToken(company: "nagi" | "stadiums"): Promise<string> {
 }
 
 export async function createMfTransaction(
-  company: "nagi" | "stadiums",
+  company: MfCompany,
   input: MfTransactionInput
 ) {
   const accessToken = await getAccessToken(company);
