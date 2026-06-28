@@ -10,8 +10,18 @@ export function middleware(req: NextRequest) {
   const user = process.env.BASIC_AUTH_USER;
   const pass = process.env.BASIC_AUTH_PASSWORD;
 
-  // 認証情報が無ければ保護無効（ローカル開発用）
-  if (!user || !pass) return NextResponse.next();
+  // 認証情報が無い場合の挙動:
+  // - Vercel上（本番/プレビュー）では fail-closed で遮断＝未保護のまま金融データを晒さない
+  // - ローカル(VERCEL未設定)では素通し＝開発を邪魔しない
+  if (!user || !pass) {
+    if (process.env.VERCEL) {
+      return new NextResponse(
+        "アクセス制御が未設定のため停止中（BASIC_AUTH_USER/PASSWORD を設定してください）",
+        { status: 503 }
+      );
+    }
+    return NextResponse.next();
+  }
 
   const header = req.headers.get("authorization");
   if (header?.startsWith("Basic ")) {
