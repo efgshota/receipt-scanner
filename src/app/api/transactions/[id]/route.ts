@@ -87,6 +87,8 @@ export async function PATCH(
   if (body.vendor) updateData.vendor = body.vendor;
   if (body.date !== undefined) updateData.date = body.date || null;
   if (body.description !== undefined) updateData.description = body.description;
+  if (body.invoiceNumber !== undefined)
+    updateData.invoiceNumber = body.invoiceNumber || null;
 
   const [updated] = await db
     .update(transactions)
