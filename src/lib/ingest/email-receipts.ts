@@ -61,6 +61,7 @@ export interface IngestOptions {
   newerThanDays?: number; // デフォルト3日（日次cron+自己修復マージン）
   maxPerAccount?: number; // 1回の実行あたり処理上限（cronの時間枠保護）
   deadlineMs?: number; // この時刻(epoch ms)を過ぎたら新規処理を止める（Vercel maxDuration保護）
+  queryTerms?: string; // 検索語の上書き（過去分バックフィル等でベンダーを絞る用途）
 }
 
 export interface IngestSummary {
@@ -75,8 +76,8 @@ export interface IngestSummary {
   accountErrors: { account: string; error: string }[];
 }
 
-function buildQuery(days: number): string {
-  const custom = process.env.GMAIL_INGEST_QUERY;
+function buildQuery(days: number, override?: string): string {
+  const custom = override ?? process.env.GMAIL_INGEST_QUERY;
   const terms = custom ?? DEFAULT_QUERY_TERMS;
   return `${terms} newer_than:${days}d -in:spam -in:trash`;
 }
@@ -430,7 +431,7 @@ export async function runEmailIngest(
     : all;
   const days = opts.newerThanDays ?? 3;
   const maxPerAccount = opts.maxPerAccount ?? 25;
-  const query = buildQuery(days);
+  const query = buildQuery(days, opts.queryTerms);
 
   const deadline = opts.deadlineMs ?? Number.POSITIVE_INFINITY;
 

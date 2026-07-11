@@ -20,6 +20,9 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const only = searchParams.get("only"); // デバッグ用: ingest|recurring|submit|billing
   const days = Number(searchParams.get("days") ?? "3");
+  // バックフィル用（手動実行時のみ想定）: q=検索語上書き / max=1アカウント処理上限
+  const q = searchParams.get("q") ?? undefined;
+  const max = searchParams.get("max");
 
   const startedAt = Date.now();
   const result: Record<string, unknown> = {};
@@ -53,6 +56,8 @@ export async function GET(request: Request) {
     runEmailIngest({
       newerThanDays: Number.isFinite(days) ? days : 3,
       deadlineMs: startedAt + 240_000,
+      queryTerms: q,
+      maxPerAccount: max ? Number(max) : undefined,
     })
   );
 
