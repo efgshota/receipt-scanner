@@ -33,6 +33,29 @@ const DEFAULT_QUERY_TERMS =
   "subject:(領収書 OR 領収証 OR レシート OR receipt OR invoice OR 請求 OR ご利用明細 OR 決済 OR payment) -from:me";
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
+// 取込除外（本人の精算対象外と指示されたもの）。From/件名/抽出ベンダー名に
+// 部分一致（小文字比較）でスキップ。env INGEST_EXCLUDE_PATTERNS で追加可能。
+// - Meta広告: 本人が精算することはない（2026-07-11 指示。再開時は連絡が来る）
+const DEFAULT_EXCLUDE_PATTERNS = [
+  "facebook.com", // noreply@business-updates.facebook.com 等のMeta系送信元
+  "facebookmail",
+  "meta広告",
+  "meta for business",
+];
+
+function excludePatterns(): string[] {
+  const extra = (process.env.INGEST_EXCLUDE_PATTERNS ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return [...DEFAULT_EXCLUDE_PATTERNS, ...extra];
+}
+
+function matchesExclude(text: string): string | null {
+  const t = text.toLowerCase();
+  return excludePatterns().find((p) => t.includes(p)) ?? null;
+}
+
 export interface IngestOptions {
   accounts?: string[]; // 未指定なら env の全アカウント
   newerThanDays?: number; // デフォルト3日（日次cron+自己修復マージン）
@@ -154,6 +177,20 @@ async function processMessage(
 ): Promise<void> {
   const msg = await getMessage(accessToken, messageId);
 
+  // 除外リスト: Claude呼び出し前に送信元/件名で弾く（APIコストもゼロ）
+  const excludedBy = matchesExclude(`${msg.from} ${msg.subject}`);
+  if (excludedBy) {
+    summary.skippedNotReceipt++;
+    await logOutcome(
+      account.name,
+      msg,
+      "skipped_excluded",
+      null,
+      `除外パターン: ${excludedBy}`
+    );
+    return;
+  }
+
   // 添付選定: PDF優先、次に画像
   const pdf = msg.attachments.find(
     (a) => a.mimeType === "application/pdf" && a.size <= MAX_ATTACHMENT_BYTES
@@ -189,6 +226,20 @@ async function processMessage(
       "skipped_not_receipt",
       null,
       extraction.reasoning
+    );
+    return;
+  }
+
+  // 除外バックストップ: 送信元が変わっても抽出ベンダー名で弾く
+  const excludedVendor = matchesExclude(extraction.vendor);
+  if (excludedVendor) {
+    summary.skippedNotReceipt++;
+    await logOutcome(
+      account.name,
+      msg,
+      "skipped_excluded",
+      null,
+      `除外パターン(vendor): ${excludedVendor}`
     );
     return;
   }
