@@ -549,6 +549,15 @@ export default function DashboardPage() {
                 >
                   画像ZIP
                 </a>
+                {bs.bucket === "nagi" && (
+                  <a
+                    href="/api/transactions/export-mf?bucket=nagi&status=approved"
+                    className="text-xs px-2 py-1 bg-indigo-100 text-indigo-800 rounded hover:bg-indigo-200"
+                    title="MFクラウド会計の仕訳帳インポート形式（承認済みのみ。借方=科目自動判定/貸方=役員借入金）"
+                  >
+                    MF仕訳CSV
+                  </a>
+                )}
               </div>
             </div>
           );
