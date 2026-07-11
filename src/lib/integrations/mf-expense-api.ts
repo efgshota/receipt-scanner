@@ -1,20 +1,22 @@
+import {
+  getValidAccessToken,
+  getStoredToken,
+  saveToken,
+  type TokenProvider,
+} from "@/lib/integrations/token-store";
+
+/**
+ * MoneyForward クラウド経費 外部API v1 クライアント。
+ *
+ * - OpenAPI spec: https://expense.moneyforward.com/api/index.json
+ *   （docs: https://github.com/moneyforward/expense-api-doc）
+ * - トークンはDB保存（oauth_tokens）。リフレッシュトークンは使い捨てローテーション。
+ * - 経費「申請」(ex_report) の作成APIは存在しない — 明細(ex_transaction)登録＋
+ *   領収書画像添付までが自動化範囲。申請への取りまとめはMF Web UIで行う。
+ */
+
 const MF_API_BASE = "https://expense.moneyforward.com/api/external/v1";
-
-interface MfTokens {
-  access_token: string;
-  token_type: string;
-  refresh_token: string;
-  expires_in: number;
-  created_at: number;
-}
-
-interface MfTransactionInput {
-  date: string;
-  amount: number;
-  vendor: string;
-  description: string;
-  invoiceNumber?: string | null;
-}
+const MF_OAUTH_BASE = "https://expense.moneyforward.com/oauth";
 
 export type MfCompany = "nagi" | "stadiums";
 
@@ -28,182 +30,320 @@ export function mfCompanyForBucket(bucket: string | null): MfCompany | null {
   return null;
 }
 
-// In-memory token cache (will be replaced with DB storage in Phase 2)
-const tokenCache: Record<string, MfTokens> = {};
-
-/**
- * MF連携が利用可能かを事前チェック（UIに「未設定/再認証が必要」を明示するため）。
- * 認証情報や有効なトークンが無い場合に submit ルートが 503 を返せるようにする。
- */
-export function getMfConfigStatus(
-  company: MfCompany
-): { configured: boolean; reason?: string } {
-  const prefix = company === "nagi" ? "MF_NAGI" : "MF_STADIUMS";
-  const missing = [
-    `${prefix}_CLIENT_ID`,
-    `${prefix}_CLIENT_SECRET`,
-    `${prefix}_OFFICE_ID`,
-  ].filter((k) => !process.env[k]);
-  if (missing.length > 0) {
-    return {
-      configured: false,
-      reason: `MFクラウド経費の認証情報が未設定です（.env: ${missing.join(", ")}）`,
-    };
-  }
-
-  // OAuthトークン（tokens.json）の有無と有効期限を確認
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require("fs") as typeof import("fs");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require("path") as typeof import("path");
-    const tokensPath = path.join(process.cwd(), "tokens.json");
-    if (!fs.existsSync(tokensPath)) {
-      return { configured: false, reason: "tokens.json が無く OAuth 未認証です" };
-    }
-    const parsed = JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as Record<
-      string,
-      MfTokens | undefined
-    >;
-    const t = parsed[company];
-    if (!t) {
-      return {
-        configured: false,
-        reason: `tokens.json に ${company} のトークンがありません（要OAuth認証）`,
-      };
-    }
-    // refresh_token があれば access_token が失効していても更新可能
-    if (!t.refresh_token) {
-      const expiresAt = (t.created_at + t.expires_in) * 1000;
-      if (Date.now() > expiresAt) {
-        return {
-          configured: false,
-          reason: `${company} のトークンが失効しており refresh_token もありません（要再OAuth認証）`,
-        };
-      }
-    }
-  } catch (e) {
-    return {
-      configured: false,
-      reason: `トークン確認に失敗: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-
-  return { configured: true };
+function providerFor(company: MfCompany): TokenProvider {
+  return company === "nagi" ? "mf_expense:nagi" : "mf_expense:stadiums";
 }
 
-async function refreshToken(
-  company: MfCompany,
-  tokens: MfTokens
-): Promise<MfTokens> {
-  const clientId =
-    company === "nagi"
-      ? process.env.MF_NAGI_CLIENT_ID!
-      : process.env.MF_STADIUMS_CLIENT_ID!;
-  const clientSecret =
-    company === "nagi"
-      ? process.env.MF_NAGI_CLIENT_SECRET!
-      : process.env.MF_STADIUMS_CLIENT_SECRET!;
+function clientCreds(company: MfCompany): {
+  clientId: string;
+  clientSecret: string;
+} | null {
+  const prefix = company === "nagi" ? "MF_NAGI" : "MF_STADIUMS";
+  const clientId = process.env[`${prefix}_CLIENT_ID`];
+  const clientSecret = process.env[`${prefix}_CLIENT_SECRET`];
+  if (!clientId || !clientSecret) return null;
+  return { clientId, clientSecret };
+}
 
-  const res = await fetch("https://expense.moneyforward.com/oauth/token", {
+// ---- OAuth ----
+
+export const MF_EXPENSE_SCOPES =
+  "office_setting:write user_setting:write transaction:write report:write public_resource:read";
+
+export function buildAuthorizeUrl(
+  company: MfCompany,
+  redirectUri: string,
+  state: string
+): string {
+  const creds = clientCreds(company);
+  if (!creds) {
+    throw new Error(
+      `MF_${company === "nagi" ? "NAGI" : "STADIUMS"}_CLIENT_ID/SECRET が未設定です`
+    );
+  }
+  const p = new URLSearchParams({
+    client_id: creds.clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: MF_EXPENSE_SCOPES,
+    state,
+  });
+  return `${MF_OAUTH_BASE}/authorize?${p}`;
+}
+
+interface MfTokenResponse {
+  access_token: string;
+  token_type: string;
+  refresh_token: string;
+  expires_in: number;
+  scope?: string;
+  created_at?: number;
+}
+
+async function tokenRequest(
+  company: MfCompany,
+  params: Record<string, string>
+): Promise<MfTokenResponse> {
+  const creds = clientCreds(company);
+  if (!creds) throw new Error(`MF ${company} のclient credentialsが未設定です`);
+  const res = await fetch(`${MF_OAUTH_BASE}/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: tokens.refresh_token,
-      client_id: clientId,
-      client_secret: clientSecret,
+      client_id: creds.clientId,
+      client_secret: creds.clientSecret,
+      ...params,
     }),
   });
-
   if (!res.ok) {
-    throw new Error(`MF token refresh failed: ${res.status}`);
+    const body = await res.text();
+    throw new Error(`MF token request failed: ${res.status} ${body.slice(0, 300)}`);
   }
-
-  const newTokens = (await res.json()) as MfTokens;
-  tokenCache[company] = newTokens;
-  persistTokens(company, newTokens);
-  return newTokens;
+  return (await res.json()) as MfTokenResponse;
 }
 
-/** リフレッシュ後の新トークンを tokens.json に書き戻す（再起動後も有効に保つ） */
-function persistTokens(company: MfCompany, tokens: MfTokens): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require("fs") as typeof import("fs");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require("path") as typeof import("path");
-    const tokensPath = path.join(process.cwd(), "tokens.json");
-    const parsed = fs.existsSync(tokensPath)
-      ? (JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as Record<string, unknown>)
-      : {};
-    parsed[company] = tokens;
-    fs.writeFileSync(tokensPath, JSON.stringify(parsed, null, 2));
-  } catch {
-    // 書き戻し失敗は致命的でない（メモリキャッシュで当面動作する）
+/** 認可コード交換＋事業者(office)発見＋DB保存。OAuth callbackから呼ぶ。 */
+export async function exchangeCodeAndConnect(
+  company: MfCompany,
+  code: string,
+  redirectUri: string
+): Promise<{ offices: { id: string; name: string }[] }> {
+  const token = await tokenRequest(company, {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirectUri,
+  });
+
+  // 事業者一覧を取得（このトークンでアクセスできるoffice）。
+  // 失敗を握り潰すと設定UIで事業者が選べず復旧不能になるため明示エラーにする
+  const officesRes = await fetch(`${MF_API_BASE}/offices`, {
+    headers: { Authorization: `Bearer ${token.access_token}` },
+  });
+  if (!officesRes.ok) {
+    const body = await officesRes.text();
+    throw new Error(
+      `事業者一覧の取得に失敗しました (${officesRes.status}): ${body.slice(0, 200)}`
+    );
   }
-}
+  let offices: { id: string; name: string }[] = [];
+  {
+    const data = (await officesRes.json()) as {
+      offices?: { id: string | number; name?: string }[];
+    };
+    const list = Array.isArray(data) ? data : (data.offices ?? []);
+    offices = (list as { id: string | number; name?: string }[]).map((o) => ({
+      id: String(o.id),
+      name: o.name ?? String(o.id),
+    }));
+  }
 
-async function getAccessToken(company: MfCompany): Promise<string> {
-  let tokens = tokenCache[company];
+  // office自動選択: envで明示 > 1件のみなら自動 > 未選択（設定UIで選ぶ）
+  const envOfficeId =
+    process.env[`MF_${company === "nagi" ? "NAGI" : "STADIUMS"}_OFFICE_ID`];
+  const officeId =
+    envOfficeId && offices.some((o) => o.id === envOfficeId)
+      ? envOfficeId
+      : offices.length === 1
+        ? offices[0].id
+        : (envOfficeId ?? null);
 
-  if (!tokens) {
-    // Load from tokens.json at runtime (file is gitignored, may be absent)
-    const fs = await import("fs");
-    const path = await import("path");
-    const tokensPath = path.join(process.cwd(), "tokens.json");
-    if (!fs.existsSync(tokensPath)) {
-      throw new Error("tokens.json not found — MF OAuth tokens not configured");
+  // 再接続時に設定済みの選択（office/経費科目）を引き継ぐ（毎回リセットさせない）
+  const prev = await getStoredToken(providerFor(company));
+  const prevOfficeId = prev?.meta?.officeId as string | null | undefined;
+  const prevExItemId = prev?.meta?.defaultExItemId as string | null | undefined;
+
+  await saveToken(
+    providerFor(company),
+    {
+      accessToken: token.access_token,
+      refreshToken: token.refresh_token,
+      scope: token.scope ?? null,
+      expiresInSec: token.expires_in,
+    },
+    {
+      offices,
+      officeId:
+        officeId ??
+        (prevOfficeId && offices.some((o) => o.id === prevOfficeId)
+          ? prevOfficeId
+          : null),
+      defaultExItemId: prevExItemId ?? null,
     }
-    const parsed = JSON.parse(fs.readFileSync(tokensPath, "utf-8")) as Record<
-      string,
-      MfTokens | undefined
-    >;
-    const loaded = parsed[company];
-    if (!loaded) {
-      throw new Error(
-        `tokens.json に ${company} のトークンがありません（要OAuth認証）`
-      );
-    }
-    tokens = loaded;
-    tokenCache[company] = tokens;
-  }
+  );
 
-  // Check if token is expired (with 5 min buffer)
-  const expiresAt = (tokens.created_at + tokens.expires_in) * 1000;
-  if (Date.now() > expiresAt - 5 * 60 * 1000) {
-    tokens = await refreshToken(company, tokens);
-  }
-
-  return tokens.access_token;
+  return { offices };
 }
 
+async function refreshExpenseToken(company: MfCompany, refreshToken: string) {
+  const t = await tokenRequest(company, {
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+  });
+  return {
+    accessToken: t.access_token,
+    refreshToken: t.refresh_token,
+    scope: t.scope ?? null,
+    expiresInSec: t.expires_in,
+  };
+}
+
+async function getAccessContext(company: MfCompany): Promise<{
+  accessToken: string;
+  officeId: string;
+  defaultExItemId: string | null;
+}> {
+  const { accessToken, meta } = await getValidAccessToken(
+    providerFor(company),
+    (rt) => refreshExpenseToken(company, rt)
+  );
+  const officeId = (meta?.officeId as string | null) ?? null;
+  if (!officeId) {
+    throw new Error(
+      `MF ${company} の事業者(office)が未選択です。設定画面で選択してください`
+    );
+  }
+  return {
+    accessToken,
+    officeId,
+    defaultExItemId: (meta?.defaultExItemId as string | null) ?? null,
+  };
+}
+
+// ---- 設定状態 ----
+
+export interface MfConfigStatus {
+  configured: boolean;
+  reason?: string;
+  needsOfficeSelection?: boolean;
+  needsExItemSelection?: boolean;
+}
+
+/** MF連携の利用可否チェック。UIとsubmitルートの503判定に使う。 */
+export async function getMfConfigStatus(
+  company: MfCompany
+): Promise<MfConfigStatus> {
+  if (!clientCreds(company)) {
+    const prefix = company === "nagi" ? "MF_NAGI" : "MF_STADIUMS";
+    return {
+      configured: false,
+      reason: `MFクラウド経費の認証情報が未設定です（env: ${prefix}_CLIENT_ID / ${prefix}_CLIENT_SECRET）`,
+    };
+  }
+  const stored = await getStoredToken(providerFor(company));
+  if (!stored) {
+    return {
+      configured: false,
+      reason: `MF ${company} は未接続です。設定画面からOAuth接続してください`,
+    };
+  }
+  if (!stored.refreshToken) {
+    const expired =
+      stored.expiresAt !== null && Date.now() > stored.expiresAt.getTime();
+    if (expired) {
+      return {
+        configured: false,
+        reason: `MF ${company} のトークンが失効しています（要再接続）`,
+      };
+    }
+  }
+  const officeId = (stored.meta?.officeId as string | null) ?? null;
+  if (!officeId) {
+    return {
+      configured: false,
+      reason: `MF ${company} の事業者(office)が未選択です`,
+      needsOfficeSelection: true,
+    };
+  }
+  const exItemId = (stored.meta?.defaultExItemId as string | null) ?? null;
+  if (!exItemId) {
+    return {
+      configured: false,
+      reason: `MF ${company} の経費科目が未選択です（設定画面で選択）`,
+      needsExItemSelection: true,
+    };
+  }
+  return { configured: true };
+}
+
+// ---- API操作 ----
+
+/** 経費科目一覧（設定UIのデフォルト科目選択用） */
+export async function listExItems(
+  company: MfCompany
+): Promise<{ id: string; name: string }[]> {
+  const { accessToken, meta } = await getValidAccessToken(
+    providerFor(company),
+    (rt) => refreshExpenseToken(company, rt)
+  );
+  const officeId = (meta?.officeId as string | null) ?? null;
+  if (!officeId) throw new Error(`MF ${company} の事業者が未選択です`);
+
+  const res = await fetch(
+    `${MF_API_BASE}/offices/${officeId}/ex_items?page=1&per=100`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (!res.ok) {
+    throw new Error(`ex_items取得失敗: ${res.status} ${await res.text()}`);
+  }
+  const data = (await res.json()) as {
+    ex_items?: { id: string | number; name?: string }[];
+  };
+  const list = Array.isArray(data) ? data : (data.ex_items ?? []);
+  return (list as { id: string | number; name?: string }[]).map((i) => ({
+    id: String(i.id),
+    name: i.name ?? String(i.id),
+  }));
+}
+
+export interface MfTransactionInput {
+  date: string;
+  amount: number;
+  vendor: string;
+  description: string;
+  invoiceNumber?: string | null;
+  /** 領収書画像（電子帳簿保存法対応の証憑添付）。Base64・4MB目安まで */
+  receiptImage?: {
+    base64: string;
+    contentType: string;
+    filename: string;
+  } | null;
+}
+
+/**
+ * 経費明細(ex_transaction)を作成する。
+ * 必須: value / recognized_at / remark(支払先,max100字) / ex_item_id
+ * 任意: memo / invoice_registration_number + invoice_kind / receipt_input(証憑)
+ */
 export async function createMfTransaction(
   company: MfCompany,
   input: MfTransactionInput
 ) {
-  const accessToken = await getAccessToken(company);
+  const { accessToken, officeId, defaultExItemId } =
+    await getAccessContext(company);
+  if (!defaultExItemId) {
+    throw new Error(
+      `MF ${company} の経費科目(ex_item)が未選択です。設定画面で選択してください`
+    );
+  }
 
-  const officeId =
-    company === "nagi"
-      ? process.env.MF_NAGI_OFFICE_ID!
-      : process.env.MF_STADIUMS_OFFICE_ID!;
-
-  const body = {
-    office_member_id: officeId,
-    ex_transaction: {
-      value: input.amount,
-      recognized_at: input.date,
-      jpyrate: 1,
-      dept_id: null,
-      project_code_id: null,
-      ex_item_id: null,
-      dr_excise_id: null,
-      cr_item_id: null,
-      cr_sub_item_id: null,
-      memo: `${input.vendor} - ${input.description}`,
-    },
+  const exTransaction: Record<string, unknown> = {
+    value: input.amount,
+    recognized_at: input.date,
+    remark: input.vendor.slice(0, 100),
+    ex_item_id: defaultExItemId,
+    memo: input.description.slice(0, 500),
   };
+  if (input.invoiceNumber) {
+    exTransaction.invoice_registration_number = input.invoiceNumber;
+    exTransaction.invoice_kind = 2; // 適格請求書
+  }
+  if (input.receiptImage) {
+    exTransaction.receipt_input = {
+      content: input.receiptImage.base64,
+      content_type: input.receiptImage.contentType,
+      filename: input.receiptImage.filename,
+    };
+  }
 
   const res = await fetch(
     `${MF_API_BASE}/offices/${officeId}/me/ex_transactions`,
@@ -213,13 +353,15 @@ export async function createMfTransaction(
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ex_transaction: exTransaction }),
     }
   );
 
   if (!res.ok) {
     const errorText = await res.text();
-    throw new Error(`MF transaction creation failed: ${res.status} ${errorText}`);
+    throw new Error(
+      `MF transaction creation failed: ${res.status} ${errorText.slice(0, 500)}`
+    );
   }
 
   return await res.json();
