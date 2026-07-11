@@ -170,6 +170,109 @@ async function storeAttachment(
   }
 }
 
+// 同一金額・近接日(±3日)の既存取引 → 重複疑い（領収書+支払完了ペアや一括発行メールの重複添付対策）
+async function isDupSuspect(amount: number, txDate: string): Promise<boolean> {
+  if (amount <= 0) return false;
+  const d = new Date(txDate);
+  const lo = new Date(d.getTime() - 3 * 86400_000).toISOString().slice(0, 10);
+  const hi = new Date(d.getTime() + 3 * 86400_000).toISOString().slice(0, 10);
+  const similar = await db
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.amount, amount),
+        gte(transactions.date, lo),
+        lte(transactions.date, hi)
+      )
+    );
+  return similar.length > 0;
+}
+
+// 一括発行メール: 各PDFを独立に抽出・分類して取引化。サブスク突合は行わない
+// （都度課金の束が前提）。sourceId は `account:messageId#index` で一意化する。
+async function processBulkPdfs(
+  account: GmailAccount,
+  accessToken: string,
+  msg: ParsedMessage,
+  pdfs: ParsedMessage["attachments"],
+  summary: IngestSummary
+): Promise<void> {
+  let imported = 0;
+  let notReceipt = 0;
+  let firstTxId: string | null = null;
+
+  for (let i = 0; i < pdfs.length; i++) {
+    const pdf = pdfs[i];
+    const buf = await getAttachment(accessToken, msg.messageId, pdf.attachmentId);
+    const extraction = await extractReceiptFromEmail({
+      subject: `${msg.subject} [添付 ${i + 1}/${pdfs.length}: ${pdf.filename}]`,
+      from: msg.from,
+      bodyText: "", // 本文は共通の案内文なので各PDFの抽出には使わない
+      pdfBase64: buf.toString("base64"),
+      imageBase64: null,
+      imageMediaType: null,
+    });
+    if (!extraction.isReceipt || matchesExclude(extraction.vendor)) {
+      notReceipt++;
+      continue;
+    }
+
+    const receiptImageUrl = await storeAttachment(
+      account.name,
+      `${msg.messageId}-${i}`,
+      pdf.filename,
+      buf,
+      "application/pdf"
+    );
+    const txDate =
+      extraction.date || msg.internalDate.toISOString().slice(0, 10);
+    const classification = await classify({
+      vendor: extraction.vendor,
+      amount: extraction.amount,
+      date: txDate,
+      description: extraction.description,
+    });
+    const dupSuspect = await isDupSuspect(extraction.amount, txDate);
+    const needsReview =
+      extraction.amount <= 0 || classification.confidence < 0.85 || dupSuspect;
+
+    const [inserted] = await db
+      .insert(transactions)
+      .values({
+        source: "gmail",
+        sourceId: `${account.name}:${msg.messageId}#${i}`,
+        vendor: extraction.vendor,
+        amount: extraction.amount,
+        date: txDate,
+        description: extraction.description,
+        invoiceNumber: extraction.invoiceNumber,
+        receiptImageUrl,
+        ocrRaw: {
+          email: { subject: msg.subject, from: msg.from, attachment: pdf.filename },
+          extraction,
+        },
+        bucket: classification.bucket,
+        confidence: classification.confidence,
+        classificationReason: `${classification.reason}（一括発行メール ${i + 1}/${pdfs.length}: ${pdf.filename}）${dupSuspect ? " | ⚠ 同額の取引あり・重複疑い" : ""}`,
+        status: needsReview ? "pending" : "classified",
+      })
+      .returning();
+    imported++;
+    if (!firstTxId) firstTxId = inserted.id;
+  }
+
+  summary.imported += imported;
+  summary.skippedNotReceipt += notReceipt;
+  await logOutcome(
+    account.name,
+    msg,
+    imported > 0 ? "imported" : "skipped_not_receipt",
+    firstTxId,
+    `一括発行メール: PDF${pdfs.length}枚中 取込${imported}件 / 対象外${notReceipt}件`
+  );
+}
+
 async function processMessage(
   account: GmailAccount,
   accessToken: string,
@@ -189,6 +292,16 @@ async function processMessage(
       null,
       `除外パターン: ${excludedBy}`
     );
+    return;
+  }
+
+  // 一括発行メール（GOの「まとめて領収書発行」等）: 領収書PDFが複数添付
+  // されている場合はPDF1枚=1領収書として個別に取引化する
+  const allPdfs = msg.attachments.filter(
+    (a) => a.mimeType === "application/pdf" && a.size <= MAX_ATTACHMENT_BYTES
+  );
+  if (allPdfs.length >= 2) {
+    await processBulkPdfs(account, accessToken, msg, allPdfs, summary);
     return;
   }
 
@@ -365,24 +478,7 @@ async function processMessage(
     description: extraction.description,
   });
 
-  // 同一金額・近接日の既存取引があれば重複疑い（同じ課金の領収書+支払完了メールペア対策）
-  let dupSuspect = false;
-  if (extraction.amount > 0) {
-    const d = new Date(txDate);
-    const lo = new Date(d.getTime() - 3 * 86400_000).toISOString().slice(0, 10);
-    const hi = new Date(d.getTime() + 3 * 86400_000).toISOString().slice(0, 10);
-    const similar = await db
-      .select({ id: transactions.id })
-      .from(transactions)
-      .where(
-        and(
-          eq(transactions.amount, extraction.amount),
-          gte(transactions.date, lo),
-          lte(transactions.date, hi)
-        )
-      );
-    dupSuspect = similar.length > 0;
-  }
+  const dupSuspect = await isDupSuspect(extraction.amount, txDate);
 
   const needsReview =
     extraction.amount <= 0 || classification.confidence < 0.85 || dupSuspect;
