@@ -1,7 +1,18 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { Nav } from "@/components/nav";
 import type { Bucket, TransactionStatus } from "@/lib/types";
+
+interface SystemAlert {
+  id: string;
+  kind: string;
+  message: string;
+}
+interface BillingAlert {
+  level: "error" | "warn";
+  message: string;
+}
 
 interface Transaction {
   id: string;
@@ -138,6 +149,8 @@ function confidenceBar(confidence: number | null) {
 export default function DashboardPage() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [sysAlerts, setSysAlerts] = useState<SystemAlert[]>([]);
+  const [billingAlerts, setBillingAlerts] = useState<BillingAlert[]>([]);
   const [loading, setLoading] = useState(true);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -159,20 +172,38 @@ export default function DashboardPage() {
   });
 
   const fetchAll = useCallback(async () => {
-    const [txRes, statsRes] = await Promise.all([
-      fetch("/api/transactions"),
-      fetch("/api/transactions/stats"),
-    ]);
-    const txData = await txRes.json();
-    const statsData = await statsRes.json();
-    setTransactions(txData.transactions || []);
-    setStats(statsData);
-    setLoading(false);
+    try {
+      const [txRes, statsRes, alertsRes] = await Promise.all([
+        fetch("/api/transactions"),
+        fetch("/api/transactions/stats"),
+        fetch("/api/alerts"),
+      ]);
+      const txData = await txRes.json().catch(() => ({}));
+      const statsData = await statsRes.json().catch(() => null);
+      const alertsData = await alertsRes.json().catch(() => ({}));
+      setTransactions(txData.transactions || []);
+      if (statsData) setStats(statsData);
+      setSysAlerts(alertsData.system ?? []);
+      setBillingAlerts(alertsData.billing ?? []);
+    } catch {
+      // ネットワーク断等: 既存表示を維持（読み込み中で固まらせない）
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  async function resolveAlert(id: string) {
+    await fetch("/api/alerts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    await fetchAll();
+  }
 
   useEffect(() => {
     // マウント時の初回データ取得（setStateはawait後＝非同期で実行される）
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+     
     fetchAll();
   }, [fetchAll]);
 
@@ -188,17 +219,20 @@ export default function DashboardPage() {
   ) {
     if (busy) return;
     setBusy(true);
-    const res = await fetch(`/api/transactions/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
-    });
-    if (!res.ok) {
-      const e = await res.json().catch(() => ({}));
-      alert(`更新できませんでした: ${e.error ?? res.status}`);
+    try {
+      const res = await fetch(`/api/transactions/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updates),
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        alert(`更新できませんでした: ${e.error ?? res.status}`);
+      }
+      await fetchAll();
+    } finally {
+      setBusy(false);
     }
-    await fetchAll();
-    setBusy(false);
   }
 
   async function bulk(
@@ -238,20 +272,23 @@ export default function DashboardPage() {
       return;
 
     setBusy(true);
-    const res = await fetch("/api/transactions/bulk", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bucket,
-        fromStatus,
-        toStatus,
-        ids: targets.map((t) => t.id),
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    await fetchAll();
-    setBusy(false);
-    if (!res.ok) alert(`処理できませんでした: ${data.error ?? res.status}`);
+    try {
+      const res = await fetch("/api/transactions/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bucket,
+          fromStatus,
+          toStatus,
+          ids: targets.map((t) => t.id),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      await fetchAll();
+      if (!res.ok) alert(`処理できませんでした: ${data.error ?? res.status}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   // 取引1件をMFクラウド経費へ直接提出
@@ -259,11 +296,14 @@ export default function DashboardPage() {
     if (busy) return;
     if (!confirm("この取引をMFクラウド経費へ提出します。よろしいですか？")) return;
     setBusy(true);
-    const res = await fetch(`/api/transactions/${id}/submit`, { method: "POST" });
-    const data = await res.json().catch(() => ({}));
-    await fetchAll();
-    setBusy(false);
-    if (!res.ok) alert(`MF提出に失敗しました: ${data.error ?? res.status}`);
+    try {
+      const res = await fetch(`/api/transactions/${id}/submit`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      await fetchAll();
+      if (!res.ok) alert(`MF提出に失敗しました: ${data.error ?? res.status}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   // バケツ内の承認済をまとめてMFクラウド経費へ提出
@@ -283,26 +323,29 @@ export default function DashboardPage() {
     )
       return;
     setBusy(true);
-    const res = await fetch("/api/transactions/submit-bulk", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: targets.map((t) => t.id) }),
-    });
-    const data = await res.json().catch(() => ({}));
-    await fetchAll();
-    setBusy(false);
-    if (!res.ok) {
-      alert(`MF一括提出に失敗しました: ${data.error ?? res.status}`);
-      return;
-    }
-    if (data.aborted) {
-      alert(`MF未設定のため中断しました: ${data.aborted}`);
-    } else if (data.failedCount > 0) {
-      alert(
-        `提出 ${data.submitted}件 / 失敗 ${data.failedCount}件。\n失敗の先頭: ${data.failed?.[0]?.error ?? "-"}`
-      );
-    } else {
-      alert(`${data.submitted}件をMFへ提出しました`);
+    try {
+      const res = await fetch("/api/transactions/submit-bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: targets.map((t) => t.id) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      await fetchAll();
+      if (!res.ok) {
+        alert(`MF一括提出に失敗しました: ${data.error ?? res.status}`);
+        return;
+      }
+      if (data.aborted) {
+        alert(`MF未設定のため中断しました: ${data.aborted}`);
+      } else if (data.failedCount > 0) {
+        alert(
+          `提出 ${data.submitted}件 / 失敗 ${data.failedCount}件。\n失敗の先頭: ${data.failed?.[0]?.error ?? "-"}`
+        );
+      } else {
+        alert(`${data.submitted}件をMFへ提出しました`);
+      }
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -369,14 +412,42 @@ export default function DashboardPage() {
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">Receipt Scanner — 経費精算</h1>
-        <a
-          href="/upload"
-          className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
-        >
-          レシート撮影
-        </a>
+        <h1 className="text-2xl font-bold">経費・請求ハブ</h1>
+        <Nav />
       </div>
+
+      {/* ===== システム/請求アラート ===== */}
+      {(sysAlerts.length > 0 || billingAlerts.length > 0) && (
+        <div className="mb-6 space-y-2">
+          {sysAlerts.map((a) => (
+            <div
+              key={a.id}
+              className="flex items-center justify-between px-4 py-2 rounded-lg bg-red-50 border border-red-200 text-sm text-red-800"
+            >
+              <span>🔴 {a.message}</span>
+              <button
+                onClick={() => resolveAlert(a.id)}
+                className="text-xs px-2 py-1 bg-white border border-red-200 rounded hover:bg-red-100"
+              >
+                解決済みにする
+              </button>
+            </div>
+          ))}
+          {billingAlerts.map((a, i) => (
+            <a
+              key={`b-${i}`}
+              href="/billing"
+              className={`block px-4 py-2 rounded-lg border text-sm ${
+                a.level === "error"
+                  ? "bg-red-50 border-red-200 text-red-800"
+                  : "bg-yellow-50 border-yellow-200 text-yellow-800"
+              }`}
+            >
+              {a.level === "error" ? "🔴" : "⚠️"} {a.message}
+            </a>
+          ))}
+        </div>
+      )}
 
       {/* ===== 精算進捗パネル ===== */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
@@ -573,7 +644,16 @@ export default function DashboardPage() {
                   <tr key={tx.id} className="border-b border-border hover:bg-gray-50 align-top">
                     {/* 画像サムネ */}
                     <td className="p-2">
-                      {tx.receiptImageUrl && !brokenImg.has(tx.id) ? (
+                      {tx.receiptImageUrl?.split("?")[0].endsWith(".pdf") ? (
+                        <a
+                          href={tx.receiptImageUrl}
+                          target="_blank"
+                          className="w-10 h-10 rounded bg-red-50 border border-red-200 flex items-center justify-center text-[9px] font-medium text-red-700 hover:ring-2 hover:ring-primary"
+                          title="PDF証憑を開く"
+                        >
+                          PDF
+                        </a>
+                      ) : tx.receiptImageUrl && !brokenImg.has(tx.id) ? (
                         // eslint-disable-next-line @next/next/no-img-element
                         <img
                           src={tx.receiptImageUrl}

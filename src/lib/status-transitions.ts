@@ -14,7 +14,10 @@ export const ALL_STATUSES: TransactionStatus[] = [
 export const ALLOWED_FROM: Record<TransactionStatus, TransactionStatus[]> = {
   pending: ["pending", "classified", "approved"], // 差戻し含む
   classified: ["pending", "classified", "approved"],
-  approved: ["pending", "classified", "approved"], // 承認は要確認/分類済から
+  // 承認は要確認/分類済から。submitted/attached からは「差戻し」
+  // （提出済ロックの解除）— mfTransactionId は保持されるため、MF登録済みの
+  // 取引は再提出時に二重送信ガード(409)で止まる。
+  approved: ["pending", "classified", "approved", "submitted", "attached"],
   submitted: ["approved", "submitted"], // 提出は承認済からのみ
   attached: ["submitted", "attached"],
   rejected: ["pending", "classified", "approved", "submitted", "attached", "rejected"],
