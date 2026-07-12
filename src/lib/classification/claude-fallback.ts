@@ -30,7 +30,7 @@ export async function classifyWithClaude(
 {"bucket": "nagi" | "stadiums" | "family", "confidence": 0.0-1.0, "reason": "判断理由"}`;
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-4-6",
     max_tokens: 200,
     messages: [{ role: "user", content: prompt }],
   });

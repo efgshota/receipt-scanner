@@ -248,8 +248,14 @@ async function uploadPhoto(
         filename
       );
 
+      const headers: Record<string, string> = {};
+      if (process.env.RECEIPT_SCANNER_AUTH) {
+        headers["Authorization"] =
+          "Basic " + Buffer.from(process.env.RECEIPT_SCANNER_AUTH).toString("base64");
+      }
       const res = await fetch(`${API_BASE}/api/receipts/upload`, {
         method: "POST",
+        headers,
         body: formData,
       });
 

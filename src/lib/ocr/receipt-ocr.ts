@@ -9,7 +9,7 @@ export async function extractReceiptData(
   mediaType: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg"
 ): Promise<OcrResult> {
   const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-4-6",
     max_tokens: 1000,
     messages: [
       {
