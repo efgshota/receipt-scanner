@@ -192,8 +192,8 @@ async function isDupSuspect(amount: number, txDate: string): Promise<boolean> {
 // 一括発行メール: 各PDFを独立に抽出・分類して取引化。サブスク突合は行わない
 // （都度課金の束が前提）。sourceId は `account:messageId#index` で一意化する。
 async function processBulkPdfs(
-  account: GmailAccount,
-  accessToken: string,
+  accountName: string,
+  fetchAttachment: (attachmentId: string) => Promise<Buffer>,
   msg: ParsedMessage,
   pdfs: ParsedMessage["attachments"],
   summary: IngestSummary
@@ -204,7 +204,7 @@ async function processBulkPdfs(
 
   for (let i = 0; i < pdfs.length; i++) {
     const pdf = pdfs[i];
-    const buf = await getAttachment(accessToken, msg.messageId, pdf.attachmentId);
+    const buf = await fetchAttachment(pdf.attachmentId);
     const extraction = await extractReceiptFromEmail({
       subject: `${msg.subject} [添付 ${i + 1}/${pdfs.length}: ${pdf.filename}]`,
       from: msg.from,
@@ -219,7 +219,7 @@ async function processBulkPdfs(
     }
 
     const receiptImageUrl = await storeAttachment(
-      account.name,
+      accountName,
       `${msg.messageId}-${i}`,
       pdf.filename,
       buf,
@@ -241,7 +241,7 @@ async function processBulkPdfs(
       .insert(transactions)
       .values({
         source: "gmail",
-        sourceId: `${account.name}:${msg.messageId}#${i}`,
+        sourceId: `${accountName}:${msg.messageId}#${i}`,
         vendor: extraction.vendor,
         amount: extraction.amount,
         date: txDate,
@@ -265,7 +265,7 @@ async function processBulkPdfs(
   summary.imported += imported;
   summary.skippedNotReceipt += notReceipt;
   await logOutcome(
-    account.name,
+    accountName,
     msg,
     imported > 0 ? "imported" : "skipped_not_receipt",
     firstTxId,
@@ -280,13 +280,28 @@ async function processMessage(
   summary: IngestSummary
 ): Promise<void> {
   const msg = await getMessage(accessToken, messageId);
+  await processIncoming(
+    account.name,
+    msg,
+    (attachmentId) => getAttachment(accessToken, messageId, attachmentId),
+    summary
+  );
+}
+
+/** メール1通の共通処理。Gmail/IMAPどちらの取込経路からも呼ばれる */
+export async function processIncoming(
+  accountName: string,
+  msg: ParsedMessage,
+  fetchAttachment: (attachmentId: string) => Promise<Buffer>,
+  summary: IngestSummary
+): Promise<void> {
 
   // 除外リスト: Claude呼び出し前に送信元/件名で弾く（APIコストもゼロ）
   const excludedBy = matchesExclude(`${msg.from} ${msg.subject}`);
   if (excludedBy) {
     summary.skippedNotReceipt++;
     await logOutcome(
-      account.name,
+      accountName,
       msg,
       "skipped_excluded",
       null,
@@ -297,18 +312,23 @@ async function processMessage(
 
   // 一括発行メール（GOの「まとめて領収書発行」等）: 領収書PDFが複数添付
   // されている場合はPDF1枚=1領収書として個別に取引化する
-  const allPdfs = msg.attachments.filter(
+  let allPdfs = msg.attachments.filter(
     (a) => a.mimeType === "application/pdf" && a.size <= MAX_ATTACHMENT_BYTES
   );
+  // Stripe系はInvoice-*.pdfとReceipt-*.pdfのペアで同一課金を送ってくる。
+  // 両方あるときは領収書（Receipt-）のみ処理して二重計上を防ぐ
+  const hasReceiptPdf = allPdfs.some((a) => /^receipt[-_]/i.test(a.filename));
+  const hasInvoicePdf = allPdfs.some((a) => /^invoice[-_]/i.test(a.filename));
+  if (hasReceiptPdf && hasInvoicePdf) {
+    allPdfs = allPdfs.filter((a) => !/^invoice[-_]/i.test(a.filename));
+  }
   if (allPdfs.length >= 2) {
-    await processBulkPdfs(account, accessToken, msg, allPdfs, summary);
+    await processBulkPdfs(accountName, fetchAttachment, msg, allPdfs, summary);
     return;
   }
 
-  // 添付選定: PDF優先、次に画像
-  const pdf = msg.attachments.find(
-    (a) => a.mimeType === "application/pdf" && a.size <= MAX_ATTACHMENT_BYTES
-  );
+  // 添付選定: PDF優先（ペア除外後のリストから）、次に画像
+  const pdf = allPdfs[0];
   const image = pdf
     ? undefined
     : msg.attachments.find(
@@ -318,9 +338,9 @@ async function processMessage(
   let pdfBuf: Buffer | null = null;
   let imageBuf: Buffer | null = null;
   if (pdf) {
-    pdfBuf = await getAttachment(accessToken, messageId, pdf.attachmentId);
+    pdfBuf = await fetchAttachment(pdf.attachmentId);
   } else if (image) {
-    imageBuf = await getAttachment(accessToken, messageId, image.attachmentId);
+    imageBuf = await fetchAttachment(image.attachmentId);
   }
 
   const extraction = await extractReceiptFromEmail({
@@ -335,7 +355,7 @@ async function processMessage(
   if (!extraction.isReceipt) {
     summary.skippedNotReceipt++;
     await logOutcome(
-      account.name,
+      accountName,
       msg,
       "skipped_not_receipt",
       null,
@@ -349,7 +369,7 @@ async function processMessage(
   if (excludedVendor) {
     summary.skippedNotReceipt++;
     await logOutcome(
-      account.name,
+      accountName,
       msg,
       "skipped_excluded",
       null,
@@ -362,23 +382,23 @@ async function processMessage(
   let receiptImageUrl: string | null = null;
   if (pdfBuf && pdf) {
     receiptImageUrl = await storeAttachment(
-      account.name,
-      messageId,
+      accountName,
+      msg.messageId,
       pdf.filename,
       pdfBuf,
       "application/pdf"
     );
   } else if (imageBuf && image) {
     receiptImageUrl = await storeAttachment(
-      account.name,
-      messageId,
+      accountName,
+      msg.messageId,
       image.filename,
       imageBuf,
       image.mimeType
     );
   }
 
-  const sourceId = `${account.name}:${messageId}`;
+  const sourceId = `${accountName}:${msg.messageId}`;
   const txDate =
     extraction.date ||
     msg.internalDate.toISOString().slice(0, 10); // 抽出失敗時はメール受信日
@@ -396,7 +416,7 @@ async function processMessage(
     if (generated && generated.sourceId) {
       summary.skippedDuplicate++;
       await logOutcome(
-        account.name,
+        accountName,
         msg,
         "skipped_already_linked",
         generated.id,
@@ -430,7 +450,7 @@ async function processMessage(
         .where(eq(transactions.id, generated.id));
       summary.matchedRecurring++;
       await logOutcome(
-        account.name,
+        accountName,
         msg,
         "matched_recurring",
         generated.id,
@@ -461,7 +481,7 @@ async function processMessage(
       .returning();
     summary.matchedRecurring++;
     await logOutcome(
-      account.name,
+      accountName,
       msg,
       "matched_recurring",
       inserted.id,
@@ -503,7 +523,7 @@ async function processMessage(
     .returning();
 
   summary.imported++;
-  await logOutcome(account.name, msg, "imported", inserted.id, extraction.reasoning);
+  await logOutcome(accountName, msg, "imported", inserted.id, extraction.reasoning);
 }
 
 export async function runEmailIngest(
