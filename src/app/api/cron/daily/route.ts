@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { runEmailIngest } from "@/lib/ingest/email-receipts";
+import { runImapIngest } from "@/lib/ingest/imap-receipts";
 import {
   generateRecurringTransactions,
   autoSubmitRecurring,
@@ -49,7 +50,14 @@ export async function GET(request: Request) {
   await phase("billing", () => generateScheduledInvoices(new Date()));
   // 3) 自動承認済みのMF明細登録（証憑添付込み）
   await phase("submit", () => autoSubmitRecurring());
-  // 4) メール領収書取込（サブスク突合込み）
+  // 4) IMAP取込（efg@nagi-inc.jp等・軽量なのでGmailより先。60秒上限）
+  await phase("imap", () =>
+    runImapIngest({
+      newerThanDays: Number.isFinite(days) ? days : 3,
+      deadlineMs: startedAt + 60_000,
+    })
+  );
+  // 5) メール領収書取込（サブスク突合込み）
   // 時間バジェット: maxDuration(300s)の手前で切り上げ。未処理分は冪等設計
   // （newer_than窓+dedup）により翌日の実行で自動的に拾われる。
   await phase("ingest", () =>

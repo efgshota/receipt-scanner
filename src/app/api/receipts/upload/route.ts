@@ -3,6 +3,7 @@ import { put } from "@vercel/blob";
 import { db } from "@/lib/db";
 import { transactions } from "@/lib/db/schema";
 import { extractReceiptData } from "@/lib/ocr/receipt-ocr";
+import { extractReceiptFromEmail } from "@/lib/ingest/extract";
 import { classify } from "@/lib/classification/engine";
 import fs from "fs";
 import path from "path";
@@ -36,10 +37,29 @@ export async function POST(request: Request) {
     // Convert to base64 for OCR
     const base64 = Buffer.from(arrayBuffer).toString("base64");
 
-    const mediaType = file.type as "image/jpeg" | "image/png" | "image/webp";
-
-    // Extract data via OCR
-    const ocrResult = await extractReceiptData(base64, mediaType);
+    // Extract data via OCR（PDFは書類抽出パス、画像はVision OCR）
+    let ocrResult;
+    if (file.type === "application/pdf") {
+      const ex = await extractReceiptFromEmail({
+        subject: `アップロードPDF: ${file.name}`,
+        from: "manual-upload",
+        bodyText: "",
+        pdfBase64: base64,
+        imageBase64: null,
+        imageMediaType: null,
+      });
+      ocrResult = {
+        vendor: ex.vendor,
+        amount: ex.amount,
+        date: ex.date,
+        description: ex.description,
+        invoiceNumber: ex.invoiceNumber,
+        raw: { pdfUpload: true, extraction: ex },
+      };
+    } else {
+      const mediaType = file.type as "image/jpeg" | "image/png" | "image/webp";
+      ocrResult = await extractReceiptData(base64, mediaType);
+    }
 
     // Date sanity check: receipts older than 2025 are suspicious (likely OCR error)
     const dateYear = ocrResult.date ? parseInt(ocrResult.date.slice(0, 4)) : 0;
