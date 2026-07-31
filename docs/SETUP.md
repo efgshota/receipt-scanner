@@ -1,8 +1,10 @@
 # 経費・請求ハブ 運用マニュアル（最終版）
 
 > 本番: https://receipt-scanner-flame.vercel.app （Basic認証: shota / Vercel env管理）
-> 方針: **MFのAPI連携は使わない**（アプリポータル管理者=会計事務所のため登録不可）。
+> 方針: **MFの旧API連携は使わない**（アプリポータル管理者=会計事務所のため登録不可）。
 > ハブが収集・整理・確定まで自動で行い、MFへは「取込用ファイル」で渡す。
+> 2026-08追記: MF公式リモートMCP（下記）が全プラン提供開始 — アプリポータル権限が
+> 付与され次第、NAGI分は Claude Code から直接仕訳登録に移行可能。
 
 ## 全体像 — どこが自動で、どこが手動か
 
@@ -97,6 +99,30 @@
 | IMAP_ACCOUNTS / IMAP_CREDENTIALS_NAGI | IMAP取込（アライブ） |
 | CRON_SECRET | cron認証 |
 | INGEST_EXCLUDE_PATTERNS（任意） | 追加除外 |
+
+## MF公式リモートMCP連携（2026-08 追加）
+
+MFが2026-03-26に『クラウド会計』のリモートMCPサーバーを全プラン提供開始
+（仕訳の参照・作成・更新、試算表、勘定科目・税区分取得など）。
+
+- 登録済み: `claude mcp add --scope user --transport http mf-kaikei https://beta.mcp.developers.biz.moneyforward.com/mcp/ca/v3`
+- 認証: Claude Code で `/mcp` → mf-kaikei → ブラウザでMF IDログイン
+- **前提**: NAGI株式会社のアプリポータル（管理者=大槻会計）に自分のMF IDが
+  ユーザー登録され「アプリ連携権限」が付与されていること。未付与なら大槻会計に依頼
+- 接続後のNAGIフロー: ハブで承認 → Claude Codeに「承認済みNAGI分をMFに仕訳登録して」
+  と依頼（勘定科目マッピングは export-mf の ACCOUNT_RULES と同じ）→ 提出済マーク
+- MCPが使えない間のフォールバック: 従来どおり「MF仕訳CSV」インポート
+- 注意: MCPは会計のみ。stadiums分（クラウド経費）は従来どおり画像ZIP→AI-OCR
+
+## 写真アルバム自動取込（Mac mini launchd）
+
+- 毎朝7:00に iCloud「領収書」アルバムの未処理分を自動アップロード
+- 実体: `~/.config/receipt-scanner/run-import.sh`（認証は .env の CRON_SECRET を
+  Bearer送信 — /api/receipts/upload はBearer CRON_SECRETを許可）
+- plist: `~/Library/LaunchAgents/com.nagi.receipt-photo-import.plist`
+- ログ: `~/.config/receipt-scanner/import.log`
+- 出張中もアルバムに追加するだけで翌朝取り込まれる（Mac mini起動が条件）。
+  即時に入れたい時はスマホから /upload ページへ直接アップロードでもOK
 
 ## 設計メモ（変更時の注意）
 - MFのAPI連携コード（mf-expense-api / mf-invoice-api）は残置だが**未接続・接続予定なし**
