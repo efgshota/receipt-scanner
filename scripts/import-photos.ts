@@ -367,6 +367,7 @@ async function main() {
         transactionId: result.transactionId,
       });
       successCount++;
+      saveTracking(tracking); // 中断されても進捗を失わない（重複アップロード防止）
       console.log(`  ✓ Uploaded (tx: ${result.transactionId})`);
       if (needsCleanup) cleanupExport(uploadPath);
       // サーバー負荷軽減のため待機
@@ -380,6 +381,7 @@ async function main() {
         error: String(error),
       });
       errorCount++;
+      saveTracking(tracking);
       console.log(`  ✗ Error: ${error}`);
       if (needsCleanup) cleanupExport(uploadPath);
     }
