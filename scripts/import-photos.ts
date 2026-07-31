@@ -249,7 +249,10 @@ async function uploadPhoto(
       );
 
       const headers: Record<string, string> = {};
-      if (process.env.RECEIPT_SCANNER_AUTH) {
+      if (process.env.RECEIPT_SCANNER_TOKEN) {
+        // launchd等の自動実行用: CRON_SECRETをBearerで送る（平文PWを保存しない）
+        headers["Authorization"] = `Bearer ${process.env.RECEIPT_SCANNER_TOKEN}`;
+      } else if (process.env.RECEIPT_SCANNER_AUTH) {
         headers["Authorization"] =
           "Basic " + Buffer.from(process.env.RECEIPT_SCANNER_AUTH).toString("base64");
       }

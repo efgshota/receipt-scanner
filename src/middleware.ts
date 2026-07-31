@@ -24,10 +24,11 @@ export function middleware(req: NextRequest) {
   const pass = process.env.BASIC_AUTH_PASSWORD;
 
   // Vercel Cron は Authorization: Bearer <CRON_SECRET> を付与してくる。
-  // Basic認証と同一ヘッダを奪い合うため、/api/cron/* のみBearer一致で通す。
+  // Basic認証と同一ヘッダを奪い合うため、Bearer一致で通すのは cron と
+  // サーバー間取込（Mac miniの写真自動取込 = /api/receipts/upload）のみ。
   // （CRON_SECRET未設定時はこの分岐自体が無効＝fail-closed）
   const path = req.nextUrl.pathname;
-  if (path.startsWith("/api/cron/")) {
+  if (path.startsWith("/api/cron/") || path === "/api/receipts/upload") {
     const cronSecret = process.env.CRON_SECRET;
     const header = req.headers.get("authorization");
     if (cronSecret && header && timingSafeEq(header, `Bearer ${cronSecret}`)) {
